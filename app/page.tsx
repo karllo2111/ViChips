@@ -17,6 +17,7 @@ type Room = {
     players: Player[];
     pot: number;
     status: 'waiting' | 'playing';
+    dealer_index: number;
 };
 
 export default function Home() {

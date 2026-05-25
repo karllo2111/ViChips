@@ -18,6 +18,7 @@ type RoomData = {
     status: 'waiting' | 'playing';
     current_turn: string | null;
     winner: string | null;
+    dealer_index: number;
 };
 
 export default function PokerRoom({ params }: { params: Promise<{ id: string }> }) {
@@ -25,16 +26,31 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
     const roomId = resolvedParams.id;
 
     const [room, setRoom] = useState<RoomData | null>(null);
-    const [playerName, setPlayerName] = useState('');
+    const [playerName, setPlayerName] = useState(() => {
+        if (typeof window !== 'undefined') {
+            return localStorage.getItem('poker_player_name') || '';
+        }
+        return '';
+    });
     const [hasJoined, setHasJoined] = useState(false);
     const [showWinnerModal, setShowWinnerModal] = useState(false);
     const [customBetAmount, setCustomBetAmount] = useState('');
     const [notification, setNotification] = useState<{ type: 'error' | 'success', message: string } | null>(null);
 
     useEffect(() => {
+        const currentSavedName = localStorage.getItem('poker_player_name');
+        if (currentSavedName && playerName === '') {
+            setPlayerName(currentSavedName);
+        }
+
         const fetchRoom = async () => {
             const { data } = await supabase.from('rooms').select('*').eq('id', roomId).single();
-            if (data) setRoom(data as RoomData);
+            if (data) {
+                setRoom(data as RoomData);
+                if (currentSavedName && data.players.find((p: Player) => p.name === currentSavedName)) {
+                    setHasJoined(true);
+                }
+            }
         };
         fetchRoom();
 
@@ -57,6 +73,8 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
     const joinTable = async () => {
         if (!playerName || !room) return;
 
+        localStorage.setItem('poker_player_name', playerName);
+
         if (room.players.find(p => p.name === playerName)) {
             setHasJoined(true);
             return;
@@ -70,7 +88,7 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
     };
 
     const startGame = async () => {
-        if (!room || room.status !== 'waiting' || room.players.length < 3) return;
+        if (!room || room.status !== 'waiting' || room.players.length < 2) return;
 
         // Check if any player has 0 chips
         const playerWithZeroChips = room.players.find(p => p.chips <= 0);
@@ -79,6 +97,9 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
             setTimeout(() => setNotification(null), 3000);
             return;
         }
+
+        // Rotate dealer
+        const nextDealerIndex = (room.dealer_index + 1) % room.players.length;
 
         // Take $100 ante from everyone
         const anteAmount = 100;
@@ -90,16 +111,20 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
         }));
 
         const newPot = anteAmount * room.players.length;
-        const firstPlayer = updatedPlayers[0];
+        
+        // First turn is the player after dealer
+        const firstTurnIndex = (nextDealerIndex + 1) % updatedPlayers.length;
+        const firstPlayer = updatedPlayers[firstTurnIndex];
 
         await supabase.from('rooms').update({
             players: updatedPlayers,
             pot: newPot,
             status: 'playing',
-            current_turn: firstPlayer.name
+            current_turn: firstPlayer.name,
+            dealer_index: nextDealerIndex,
+            winner: null
         }).eq('id', roomId);
     };
-
 
     const handleNextRound = async () => {
         if (!room || room.status !== 'playing') return;
@@ -110,8 +135,8 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
             currentBet: 0
         }));
 
-        // The first turn of the next round goes to the first active player
-        let nextTurnIndex = 0;
+        // In poker, the first person to act after the dealer is the first active player to their left
+        let nextTurnIndex = (room.dealer_index + 1) % updatedPlayers.length;
         let attempts = 0;
         while (updatedPlayers[nextTurnIndex].isFolded && attempts < updatedPlayers.length) {
             nextTurnIndex = (nextTurnIndex + 1) % updatedPlayers.length;
@@ -154,8 +179,16 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
     const handleRaise = async (amount: number) => {
         if (!room || room.status !== 'playing' || room.current_turn !== playerName) return;
 
+        const activePlayers = room.players.filter(p => !p.isFolded);
+        const maxBet = Math.max(...activePlayers.map(p => p.currentBet));
         const myData = room.players.find(p => p.name === playerName);
-        if (!myData || myData.chips < amount) {
+        
+        if (!myData) return;
+
+        const totalToBet = maxBet + amount;
+        const additionalBet = totalToBet - myData.currentBet;
+
+        if (myData.chips < additionalBet) {
             setNotification({ type: 'error', message: 'Chip tidak cukup!' });
             setTimeout(() => setNotification(null), 3000);
             return;
@@ -163,66 +196,63 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
 
         const updatedPlayers = room.players.map(p => {
             if (p.name === playerName) {
-                return { ...p, chips: p.chips - amount, currentBet: p.currentBet + amount };
+                return { ...p, chips: p.chips - additionalBet, currentBet: totalToBet };
             }
             return p;
         });
 
-        const newPot = room.pot + amount;
+        const newPot = room.pot + additionalBet;
 
-        // Check if betting round is complete (all active players have matched bets)
-        const activePlayers = updatedPlayers.filter(p => !p.isFolded);
-        const maxBet = Math.max(...activePlayers.map(p => p.currentBet));
-        const allMatched = activePlayers.every(p => p.currentBet === maxBet);
+        const nextTurnIndex = getNextTurnIndex(updatedPlayers);
+        const nextPlayer = updatedPlayers[nextTurnIndex];
 
-        if (allMatched && activePlayers.length > 1) {
-            // Betting round complete, reset bets for next round
-            const playersWithResetBets = updatedPlayers.map(p => ({
-                ...p,
-                currentBet: 0
-            }));
-
-            const nextTurnIndex = 0;
-            let nextTurn = nextTurnIndex;
-            let attempts = 0;
-            while (playersWithResetBets[nextTurn].isFolded && attempts < playersWithResetBets.length) {
-                nextTurn = (nextTurn + 1) % playersWithResetBets.length;
-                attempts++;
-            }
-
-            await supabase.from('rooms').update({
-                players: playersWithResetBets,
-                pot: newPot,
-                current_turn: playersWithResetBets[nextTurn].name
-            }).eq('id', roomId);
-        } else {
-            const nextTurnIndex = getNextTurnIndex(updatedPlayers);
-            const nextPlayer = updatedPlayers[nextTurnIndex];
-
-            await supabase.from('rooms').update({
-                players: updatedPlayers,
-                pot: newPot,
-                current_turn: nextPlayer.name
-            }).eq('id', roomId);
-        }
+        await supabase.from('rooms').update({
+            players: updatedPlayers,
+            pot: newPot,
+            current_turn: nextPlayer.name
+        }).eq('id', roomId);
     };
 
     const handleCustomBet = async () => {
         const amount = parseInt(customBetAmount);
-        if (!amount || amount <= 0) return;
+        if (!amount || amount <= 0 || !room) return;
 
-        // Validate minimum bet (must be at least current max bet)
-        if (room) {
-            const activePlayers = room.players.filter(p => !p.isFolded);
-            const maxBet = Math.max(...activePlayers.map(p => p.currentBet));
-            if (amount < maxBet) {
-                setNotification({ type: 'error', message: `Minimum bet adalah $${maxBet}` });
-                setTimeout(() => setNotification(null), 3000);
-                return;
-            }
+        const myData = room.players.find(p => p.name === playerName);
+        if (!myData) return;
+
+        const activePlayers = room.players.filter(p => !p.isFolded);
+        const maxBet = Math.max(...activePlayers.map(p => p.currentBet));
+
+        if (amount <= maxBet) {
+            setNotification({ type: 'error', message: `Bet harus lebih besar dari $${maxBet} (atau gunakan CALL)` });
+            setTimeout(() => setNotification(null), 3000);
+            return;
         }
 
-        await handleRaise(amount);
+        const additionalBet = amount - myData.currentBet;
+        if (myData.chips < additionalBet) {
+            setNotification({ type: 'error', message: 'Chip tidak cukup!' });
+            setTimeout(() => setNotification(null), 3000);
+            return;
+        }
+
+        const updatedPlayers = room.players.map(p => {
+            if (p.name === playerName) {
+                return { ...p, chips: p.chips - additionalBet, currentBet: amount };
+            }
+            return p;
+        });
+
+        const newPot = room.pot + additionalBet;
+        const nextTurnIndex = getNextTurnIndex(updatedPlayers);
+        const nextPlayer = updatedPlayers[nextTurnIndex];
+
+        await supabase.from('rooms').update({
+            players: updatedPlayers,
+            pot: newPot,
+            current_turn: nextPlayer.name
+        }).eq('id', roomId);
+        
         setCustomBetAmount('');
     };
 
@@ -268,40 +298,14 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
         });
 
         const newPot = room.pot + callAmount;
+        const nextTurnIndex = getNextTurnIndex(updatedPlayers);
+        const nextPlayer = updatedPlayers[nextTurnIndex];
 
-        // Check if betting round is complete
-        const allMatched = updatedPlayers.filter(p => !p.isFolded).every(p => p.currentBet === maxBet);
-
-        if (allMatched && activePlayers.length > 1) {
-            // Betting round complete, reset bets for next round
-            const playersWithResetBets = updatedPlayers.map(p => ({
-                ...p,
-                currentBet: 0
-            }));
-
-            const nextTurnIndex = 0;
-            let nextTurn = nextTurnIndex;
-            let attempts = 0;
-            while (playersWithResetBets[nextTurn].isFolded && attempts < playersWithResetBets.length) {
-                nextTurn = (nextTurn + 1) % playersWithResetBets.length;
-                attempts++;
-            }
-
-            await supabase.from('rooms').update({
-                players: playersWithResetBets,
-                pot: newPot,
-                current_turn: playersWithResetBets[nextTurn].name
-            }).eq('id', roomId);
-        } else {
-            const nextTurnIndex = getNextTurnIndex(updatedPlayers);
-            const nextPlayer = updatedPlayers[nextTurnIndex];
-
-            await supabase.from('rooms').update({
-                players: updatedPlayers,
-                pot: newPot,
-                current_turn: nextPlayer.name
-            }).eq('id', roomId);
-        }
+        await supabase.from('rooms').update({
+            players: updatedPlayers,
+            pot: newPot,
+            current_turn: nextPlayer.name
+        }).eq('id', roomId);
     };
 
     const handleAllIn = async () => {
@@ -320,42 +324,14 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
         });
 
         const newPot = room.pot + allInAmount;
+        const nextTurnIndex = getNextTurnIndex(updatedPlayers);
+        const nextPlayer = updatedPlayers[nextTurnIndex];
 
-        // Check if betting round is complete
-        const activePlayers = updatedPlayers.filter(p => !p.isFolded);
-        const maxBet = Math.max(...activePlayers.map(p => p.currentBet));
-        const allMatched = activePlayers.every(p => p.currentBet === maxBet || p.chips === 0);
-
-        if (allMatched && activePlayers.length > 1) {
-            // Betting round complete, reset bets for next round
-            const playersWithResetBets = updatedPlayers.map(p => ({
-                ...p,
-                currentBet: 0
-            }));
-
-            const nextTurnIndex = 0;
-            let nextTurn = nextTurnIndex;
-            let attempts = 0;
-            while (playersWithResetBets[nextTurn].isFolded && attempts < playersWithResetBets.length) {
-                nextTurn = (nextTurn + 1) % playersWithResetBets.length;
-                attempts++;
-            }
-
-            await supabase.from('rooms').update({
-                players: playersWithResetBets,
-                pot: newPot,
-                current_turn: playersWithResetBets[nextTurn].name
-            }).eq('id', roomId);
-        } else {
-            const nextTurnIndex = getNextTurnIndex(updatedPlayers);
-            const nextPlayer = updatedPlayers[nextTurnIndex];
-
-            await supabase.from('rooms').update({
-                players: updatedPlayers,
-                pot: newPot,
-                current_turn: nextPlayer.name
-            }).eq('id', roomId);
-        }
+        await supabase.from('rooms').update({
+            players: updatedPlayers,
+            pot: newPot,
+            current_turn: nextPlayer.name
+        }).eq('id', roomId);
     };
 
     const handleFold = async () => {
@@ -425,6 +401,16 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
         }).eq('id', roomId);
     };
 
+    const leaveTable = async () => {
+        if (!room || !playerName) return;
+
+        const updatedPlayers = room.players.filter(p => p.name !== playerName);
+        
+        await supabase.from('rooms').update({ players: updatedPlayers }).eq('id', roomId);
+        localStorage.removeItem('poker_player_name');
+        window.location.href = '/';
+    };
+
     if (!room) return <div className="p-10 text-white bg-slate-900 min-h-screen">Loading Table...</div>;
 
     if (!hasJoined) {
@@ -462,14 +448,38 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
                 {/* Room Header */}
                 <div className="flex flex-col sm:flex-row justify-between items-center mb-6 gap-4">
                     <div>
-                        <h1 className="text-2xl md:text-3xl font-bold text-yellow-400">{room.room_name}</h1>
+                        <div className="flex items-center gap-3">
+                            <h1 className="text-2xl md:text-3xl font-bold text-yellow-400">{room.room_name}</h1>
+                            <button 
+                                onClick={leaveTable}
+                                className="text-xs bg-red-500/20 hover:bg-red-500 text-red-400 hover:text-white px-2 py-1 rounded transition-all border border-red-500/50"
+                            >
+                                Keluar Meja
+                            </button>
+                        </div>
                         <p className="text-slate-300 text-sm">
                             Status: <span className={`font-semibold ${room.status === 'waiting' ? 'text-green-400' : 'text-red-400'}`}>
                                 {room.status === 'waiting' ? 'MENUNGGU' : 'BERMAIN'}
                             </span>
                         </p>
                     </div>
-                    {room.status === 'waiting' && room.players.length >= 3 && (
+                    {room.status === 'playing' && (
+                        <div className="flex gap-2">
+                            <button
+                                onClick={handleNextRound}
+                                className="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg font-bold text-white transition-all text-sm"
+                            >
+                                ⏭️ Lanjut Round
+                            </button>
+                            <button
+                                onClick={() => setShowWinnerModal(true)}
+                                className="px-4 py-2 bg-yellow-500 hover:bg-yellow-400 rounded-lg font-bold text-black transition-all text-sm"
+                            >
+                                🏆 Showdown / Selesai
+                            </button>
+                        </div>
+                    )}
+                    {room.status === 'waiting' && room.players.length >= 2 && (
                         <button
                             onClick={startGame}
                             className="px-6 py-3 bg-gradient-to-r from-yellow-500 to-orange-500 hover:from-yellow-400 hover:to-orange-400 rounded-xl font-bold text-black transition-all transform hover:scale-105 shadow-lg active:scale-95 animate-pulse"
@@ -521,9 +531,12 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
                                     : 'bg-slate-800/50 border-green-500'
                         } ${room.current_turn === p.name && !p.isFolded ? 'ring-2 ring-yellow-400' : ''}`}>
                             <div className="flex justify-between items-start mb-2">
-                                <h3 className="font-bold text-base md:text-lg">
+                                <h3 className="font-bold text-base md:text-lg flex items-center gap-2">
                                     {p.name} 
                                     {p.name === playerName && ' (Kamu)'}
+                                    {room.dealer_index === idx && (
+                                        <span className="bg-white text-black text-[10px] px-1.5 py-0.5 rounded-full font-black border border-slate-400">D</span>
+                                    )}
                                 </h3>
                                 {room.current_turn === p.name && !p.isFolded && (
                                     <span className="text-xs bg-yellow-500 text-black px-2 py-1 rounded font-bold">AKTIF</span>
