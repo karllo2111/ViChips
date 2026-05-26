@@ -37,12 +37,8 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
     const [notification, setNotification] = useState<{ type: 'error' | 'success', message: string } | null>(null);
 
     useEffect(() => {
-        const currentSavedName = localStorage.getItem('poker_player_name');
-        if (currentSavedName && playerName === '') {
-            setPlayerName(currentSavedName);
-        }
-
         const fetchRoom = async () => {
+            const currentSavedName = localStorage.getItem('poker_player_name');
             const { data } = await supabase.from('rooms').select('*').eq('id', roomId).single();
             if (data) {
                 setRoom(data as RoomData);
@@ -125,12 +121,176 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
         }).eq('id', roomId);
     };
 
-    const startGame = async () => {
-        if (!room || room.status !== 'waiting' || room.players.length < 2) return;
+    const leaveTable = async () => {
+        if (!room) return;
+        const updatedPlayers = room.players.filter(p => p.name !== playerName);
+        await supabase.from('rooms').update({ players: updatedPlayers }).eq('id', roomId);
+        setHasJoined(false);
+        localStorage.removeItem('poker_player_name');
+    };
+
+    const handleCheck = async () => {
+        if (!room || !isMyTurn) return;
+        const nextTurnIndex = (room.players.findIndex(p => p.name === room.current_turn) + 1) % room.players.length;
+        const nextPlayer = room.players[nextTurnIndex];
+        
+        await supabase.from('rooms').update({
+            current_turn: nextPlayer.name
+        }).eq('id', roomId);
+    };
+
+    const handleCall = async () => {
+        if (!room || !myData || !isMyTurn) return;
+        const maxBet = Math.max(...room.players.map(p => p.currentBet));
+        const callAmount = maxBet - myData.currentBet;
+        
+        if (callAmount > myData.chips) {
+            setNotification({ type: 'error', message: 'Chip tidak cukup!' });
+            setTimeout(() => setNotification(null), 3000);
+            return;
+        }
+
+        const updatedPlayers = room.players.map(p => 
+            p.name === playerName 
+                ? { ...p, chips: p.chips - callAmount, currentBet: maxBet }
+                : p
+        );
+        
+        const newPot = room.pot + callAmount;
+        const nextTurnIndex = (room.players.findIndex(p => p.name === room.current_turn) + 1) % updatedPlayers.length;
+        const nextPlayer = updatedPlayers[nextTurnIndex];
+
+        checkForWinner(updatedPlayers, newPot, nextPlayer.name);
+    };
+
+    const handleRaise = async (raiseAmount: number) => {
+        if (!room || !myData || !isMyTurn) return;
+        const maxBet = Math.max(...room.players.map(p => p.currentBet));
+        const newBet = maxBet + raiseAmount;
+        const betDifference = newBet - myData.currentBet;
+
+        if (betDifference > myData.chips) {
+            setNotification({ type: 'error', message: 'Chip tidak cukup!' });
+            setTimeout(() => setNotification(null), 3000);
+            return;
+        }
+
+        const updatedPlayers = room.players.map(p => 
+            p.name === playerName 
+                ? { ...p, chips: p.chips - betDifference, currentBet: newBet }
+                : p
+        );
+
+        const newPot = room.pot + betDifference;
+        const nextTurnIndex = (room.players.findIndex(p => p.name === room.current_turn) + 1) % updatedPlayers.length;
+        const nextPlayer = updatedPlayers[nextTurnIndex];
+
+        checkForWinner(updatedPlayers, newPot, nextPlayer.name);
+    };
+
+    const handleAllIn = async () => {
+        if (!room || !myData || !isMyTurn) return;
+        const allInAmount = myData.chips;
+        const maxBet = Math.max(...room.players.map(p => p.currentBet));
+        const newBet = maxBet + allInAmount;
+
+        const updatedPlayers = room.players.map(p => 
+            p.name === playerName 
+                ? { ...p, chips: 0, currentBet: newBet }
+                : p
+        );
+
+        const newPot = room.pot + allInAmount;
+        const nextTurnIndex = (room.players.findIndex(p => p.name === room.current_turn) + 1) % updatedPlayers.length;
+        const nextPlayer = updatedPlayers[nextTurnIndex];
+
+        checkForWinner(updatedPlayers, newPot, nextPlayer.name);
+    };
+
+    const handleFold = async () => {
+        if (!room || !isMyTurn) return;
+        const updatedPlayers = room.players.map(p => 
+            p.name === playerName 
+                ? { ...p, isFolded: true }
+                : p
+        );
+
+        const nextTurnIndex = (room.players.findIndex(p => p.name === room.current_turn) + 1) % updatedPlayers.length;
+        const nextPlayer = updatedPlayers[nextTurnIndex];
+
+        checkForWinner(updatedPlayers, room.pot, nextPlayer.name);
+    };
+
+    const handleCustomBet = async () => {
+        if (!room || !myData || !isMyTurn || !customBetAmount) return;
+        const betAmount = parseInt(customBetAmount);
+
+        if (betAmount > myData.chips) {
+            setNotification({ type: 'error', message: 'Chip tidak cukup!' });
+            setTimeout(() => setNotification(null), 3000);
+            return;
+        }
+
+        const maxBet = Math.max(...room.players.map(p => p.currentBet));
+        const newBet = maxBet + betAmount;
+        const totalBet = newBet - myData.currentBet;
+
+        const updatedPlayers = room.players.map(p => 
+            p.name === playerName 
+                ? { ...p, chips: p.chips - totalBet, currentBet: newBet }
+                : p
+        );
+
+        const newPot = room.pot + totalBet;
+        const nextTurnIndex = (room.players.findIndex(p => p.name === room.current_turn) + 1) % updatedPlayers.length;
+        const nextPlayer = updatedPlayers[nextTurnIndex];
+
+        setCustomBetAmount('');
+        checkForWinner(updatedPlayers, newPot, nextPlayer.name);
+    };
+
+    const checkForWinner = async (updatedPlayers: Player[], newPot: number, nextTurnName: string) => {
+        const activePlayers = updatedPlayers.filter(p => !p.isFolded);
+        
+        if (activePlayers.length === 1) {
+            // Winner found - give them the pot
+            const winnerIndex = updatedPlayers.findIndex(p => p.name === activePlayers[0].name);
+            const finalPlayers = updatedPlayers.map((p, idx) => 
+                idx === winnerIndex 
+                    ? { ...p, chips: p.chips + newPot }
+                    : p
+            );
+
+            await supabase.from('rooms').update({
+                players: finalPlayers,
+                pot: 0,
+                status: 'waiting',
+                current_turn: null,
+                winner: activePlayers[0].name
+            }).eq('id', roomId);
+
+            setNotification({ type: 'success', message: `${activePlayers[0].name} menang dan mendapat $${newPot}!` });
+            setTimeout(() => setNotification(null), 5000);
+        } else {
+            await supabase.from('rooms').update({
+                players: updatedPlayers,
+                pot: newPot,
+                current_turn: nextTurnName
+            }).eq('id', roomId);
+        }
+    };
+
+    if (!room) {
+        return (
+            <div className="flex flex-col items-center justify-center min-h-screen bg-linear-to-br from-slate-900 via-slate-800 to-slate-900 text-white p-4">
+                <p>Loading...</p>
+            </div>
+        );
+    }
 
     if (!hasJoined) {
         return (
-            <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white p-4">
+            <div className="flex flex-col items-center justify-center min-h-screen bg-linear-to-br from-slate-900 via-slate-800 to-slate-900 text-white p-4">
                 <div className="bg-slate-800/50 backdrop-blur-sm p-8 rounded-2xl w-full max-w-md shadow-2xl border border-slate-700">
                     <h1 className="text-3xl font-bold mb-2 text-center text-yellow-400">{room.room_name}</h1>
                     <p className="text-center text-slate-400 mb-6">Join meja untuk bermain</p>
@@ -142,7 +302,7 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
                         onChange={(e) => setPlayerName(e.target.value)}
                         onKeyPress={(e) => e.key === 'Enter' && joinTable()}
                     />
-                    <button onClick={joinTable} className="w-full bg-gradient-to-r from-yellow-500 to-orange-500 hover:from-yellow-400 hover:to-orange-400 p-4 rounded-xl font-bold text-black transition-all transform hover:scale-105">
+                    <button onClick={joinTable} className="w-full bg-linear-to-r from-yellow-500 to-orange-500 hover:from-yellow-400 hover:to-orange-400 p-4 rounded-xl font-bold text-black transition-all transform hover:scale-105">
                         Join Meja
                     </button>
                     <div className="mt-4 text-center text-slate-400 text-sm">
@@ -157,7 +317,7 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
     const isMyTurn = room.current_turn === playerName;
 
     return (
-        <div className="min-h-screen bg-gradient-to-br from-green-900 via-green-800 to-green-900 text-white p-4 md:p-8 font-sans">
+        <div className="min-h-screen bg-linear-to-br from-green-900 via-green-800 to-green-900 text-white p-4 md:p-8 font-sans">
             <div className="max-w-4xl mx-auto pb-32 md:pb-8">
 
                 {/* Room Header */}
@@ -181,26 +341,12 @@ export default function PokerRoom({ params }: { params: Promise<{ id: string }> 
                     {room.status === 'waiting' && room.players.length >= 2 && (
                         <button
                             onClick={startGame}
-                            className="px-6 py-3 bg-gradient-to-r from-yellow-500 to-orange-500 hover:from-yellow-400 hover:to-orange-400 rounded-xl font-bold text-black transition-all transform hover:scale-105 shadow-lg active:scale-95 animate-pulse"
+                            className="px-6 py-3 bg-linear-to-r from-yellow-500 to-orange-500 hover:from-yellow-400 hover:to-orange-400 rounded-xl font-bold text-black transition-all transform hover:scale-105 shadow-lg active:scale-95 animate-pulse"
                         >
                             🚀 Mulai Game
                         </button>
                     )}
                 </div>
-
-                {/* Winner Announcement */}
-                {room.winner && (
-                    <div className="bg-yellow-500/20 border-2 border-yellow-500 rounded-2xl p-6 mb-6 text-center">
-                        <h2 className="text-3xl font-black text-yellow-400 mb-2">🎉 {room.winner} MENANG! 🎉</h2>
-                        <p className="text-white">Mendapatkan ${room.pot}</p>
-                        <button
-                            onClick={resetGame}
-                            className="mt-4 px-6 py-2 bg-yellow-500 hover:bg-yellow-400 rounded-lg font-bold text-black transition-all"
-                        >
-                            Main Lagi
-                        </button>
-                    </div>
-                )}
 
                 {/* Pot Info */}
                 <div className="bg-green-800/50 backdrop-blur-sm border-4 border-green-700 rounded-full py-8 md:py-12 text-center my-6 md:my-8 shadow-2xl relative">
