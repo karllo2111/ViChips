@@ -3,166 +3,310 @@
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import { useRouter } from "next/navigation";
-
-type Player = {
-    name: string;
-    chips: number;
-    currentBet: number;
-    isFolded: boolean;
-};
-
-type Room = {
-    id: string;
-    room_name: string;
-    players: Player[];
-    pot: number;
-    status: 'waiting' | 'playing';
-    dealer_index: number;
-};
+import { formatRupiah } from "@/lib/poker-logic";
+import type { RoomData } from "@/lib/poker-logic";
 
 export default function Home() {
     const router = useRouter();
-    const [rooms, setRooms] = useState<Room[]>([]);
+    const [rooms, setRooms] = useState<RoomData[]>([]);
     const [newRoomName, setNewRoomName] = useState('');
     const [loading, setLoading] = useState(true);
+    const [showJoinModal, setShowJoinModal] = useState<RoomData | null>(null);
+    const [joinName, setJoinName] = useState('');
+    const [joinBalance, setJoinBalance] = useState('500000');
+    const [joinRole, setJoinRole] = useState<'player' | 'dealer'>('player');
+    const [creating, setCreating] = useState(false);
 
     const fetchRooms = async () => {
         const { data } = await supabase.from('rooms').select('*');
-        if (data) setRooms(data as Room[]);
+        if (data) setRooms(data as RoomData[]);
         setLoading(false);
     };
 
     useEffect(() => {
-        const fetchRoomsAsync = async () => {
-            await fetchRooms();
-        };
-        fetchRoomsAsync();
-
+        fetchRooms();
         const channel = supabase
-            .channel('rooms-changes')
-            .on(
-                'postgres_changes',
-                { event: '*', schema: 'public', table: 'rooms' },
-                () => fetchRooms()
-            )
+            .channel('rooms-lobby')
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms' }, fetchRooms)
             .subscribe();
-
-        return () => {
-            supabase.removeChannel(channel);
-        };
+        return () => { supabase.removeChannel(channel); };
     }, []);
 
     const createRoom = async () => {
-        if (!newRoomName.trim()) return;
-
-        const { data, error } = await supabase
-            .from('rooms')
-            .insert({
-                room_name: newRoomName,
-                players: [],
-                pot: 0,
-                status: 'waiting',
-                current_turn: null,
-                dealer_index: -1,
-                winner: null
-            })
-            .select()
-            .single();
-
-        if (error) {
-            console.error('Error creating room:', error);
-            return;
-        }
-
-        if (data) {
-            setNewRoomName('');
-            router.push(`/room/${data.id}`);
+        if (!newRoomName.trim() || creating) return;
+        setCreating(true);
+        try {
+            const { data, error } = await supabase
+                .from('rooms')
+                .insert({
+                    room_name: newRoomName.trim(),
+                    players: [],
+                    pot: 0,
+                    status: 'waiting',
+                    current_turn: null,
+                    dealer_index: -1,
+                    winner: null,
+                    current_phase: 'WAITING',
+                    current_highest_bet: 0,
+                    last_raise_increment: 0,
+                    small_blind: 0,
+                    big_blind: 0,
+                    sb_index: 0,
+                    bb_index: 1,
+                })
+                .select()
+                .single();
+            if (error) {
+                console.error('Gagal membuat room:', error);
+                alert('Gagal membuat room: ' + error.message);
+            } else if (data) {
+                setNewRoomName('');
+                setShowJoinModal(data as RoomData);
+            }
+        } catch (err) {
+            console.error('Error creating room:', err);
+            alert('Error: ' + (err instanceof Error ? err.message : 'Unknown error'));
+        } finally {
+            setCreating(false);
         }
     };
 
-    const joinRoom = (roomId: string) => {
-        router.push(`/room/${roomId}`);
+    const handleJoinConfirm = () => {
+        if (!showJoinModal || !joinName.trim()) return;
+        const bal = parseInt(joinBalance) || 500000;
+        localStorage.setItem('vi_name', joinName.trim());
+        localStorage.setItem('vi_balance', String(bal));
+        localStorage.setItem('vi_role', joinRole);
+        router.push(`/room/${showJoinModal.id}`);
+    };
+
+    const openJoinModal = (room: RoomData) => {
+        const savedName = localStorage.getItem('vi_name') || '';
+        const savedBalance = localStorage.getItem('vi_balance') || '500000';
+        setJoinName(savedName);
+        setJoinBalance(savedBalance);
+        setJoinRole('player');
+        setShowJoinModal(room);
+    };
+
+    const phaseLabel = (phase: string) => {
+        const map: Record<string, string> = {
+            WAITING: 'Menunggu', 'PRE-FLOP': 'Pre-Flop',
+            FLOP: 'Flop', TURN: 'Turn', RIVER: 'River', SHOWDOWN: 'Showdown',
+        };
+        return map[phase] ?? phase;
     };
 
     return (
-        <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white p-4 md:p-8">
-            <div className="max-w-6xl mx-auto">
-                {/* Header */}
-                <div className="text-center mb-8 md:mb-12">
-                    <h1 className="text-4xl md:text-6xl font-black mb-4 bg-gradient-to-r from-yellow-400 to-orange-500 bg-clip-text text-transparent">
-                        VI-CHIP POKER
-                    </h1>
-                    <p className="text-slate-400 text-lg md:text-xl">Pilih room atau buat room baru untuk bermain</p>
+        <div style={{ minHeight: '100dvh', background: 'var(--bg-primary)', padding: '24px 16px' }}>
+            <div style={{ maxWidth: 700, margin: '0 auto' }}>
+
+                {/* ── Header ── */}
+                <div style={{ textAlign: 'center', marginBottom: 40 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.15em', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: 10 }}>
+                        Virtual Chip Manager
+                    </div>
+                    <h1 style={{
+                        fontSize: 'clamp(36px, 8vw, 60px)', fontWeight: 900,
+                        background: 'linear-gradient(135deg, #facc15, #f97316)',
+                        WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
+                        backgroundClip: 'text', lineHeight: 1.1, marginBottom: 10,
+                    }}>VI-CHIP</h1>
+                    <p style={{ color: 'var(--text-secondary)', fontSize: 15 }}>
+                        Texas Hold&apos;em Poker · Chip Management System
+                    </p>
                 </div>
 
-                {/* Create Room Section */}
-                <div className="bg-slate-800/50 backdrop-blur-sm rounded-2xl p-6 md:p-8 mb-8 border border-slate-700">
-                    <h2 className="text-2xl font-bold mb-4 text-yellow-400">Buat Room Baru</h2>
-                    <div className="flex flex-col sm:flex-row gap-4">
+                {/* ── Create Room ── */}
+                <div className="glass" style={{ padding: 24, marginBottom: 24 }}>
+                    <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 14 }}>
+                        Buat Room Baru
+                    </h2>
+                    <div style={{ display: 'flex', gap: 10 }}>
                         <input
-                            type="text"
-                            placeholder="Nama Room..."
-                            className="flex-1 p-4 rounded-xl bg-slate-700 border border-slate-600 focus:outline-none focus:ring-2 focus:ring-yellow-500 text-white placeholder-slate-400"
+                            className="input-field"
+                            placeholder="Nama Room (contoh: Meja Jumat)"
                             value={newRoomName}
-                            onChange={(e) => setNewRoomName(e.target.value)}
-                            onKeyPress={(e) => e.key === 'Enter' && createRoom()}
+                            onChange={e => setNewRoomName(e.target.value)}
+                            onKeyDown={e => e.key === 'Enter' && createRoom()}
+                            style={{ flex: 1, fontFamily: 'Inter, sans-serif', fontWeight: 500 }}
                         />
                         <button
+                            className="btn-primary"
                             onClick={createRoom}
-                            className="px-8 py-4 bg-gradient-to-r from-yellow-500 to-orange-500 hover:from-yellow-400 hover:to-orange-400 rounded-xl font-bold text-black transition-all transform hover:scale-105"
+                            disabled={creating || !newRoomName.trim()}
+                            suppressHydrationWarning
+                            style={{ whiteSpace: 'nowrap', fontSize: 14 }}
                         >
-                            Buat Room
+                            {creating ? '...' : '+ Buat'}
                         </button>
                     </div>
                 </div>
 
-                {/* Room List */}
-                <div className="bg-slate-800/50 backdrop-blur-sm rounded-2xl p-6 md:p-8 border border-slate-700">
-                    <h2 className="text-2xl font-bold mb-6 text-yellow-400">Daftar Room</h2>
-                    
+                {/* ── Room List ── */}
+                <div className="glass" style={{ padding: 24 }}>
+                    <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 16 }}>
+                        Daftar Room
+                    </h2>
+
                     {loading ? (
-                        <div className="text-center text-slate-400 py-8">Memuat rooms...</div>
+                        <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '32px 0' }}>Memuat...</div>
                     ) : rooms.length === 0 ? (
-                        <div className="text-center text-slate-400 py-8">Belum ada room. Buat room baru!</div>
+                        <div style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '40px 0' }}>
+                            <div style={{ fontSize: 40, marginBottom: 12 }}>🃏</div>
+                            <p>Belum ada room. Buat room baru di atas!</p>
+                        </div>
                     ) : (
-                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                            {rooms.map((room) => (
-                                <div
-                                    key={room.id}
-                                    className="bg-slate-700/50 rounded-xl p-5 border border-slate-600 hover:border-yellow-500 transition-all cursor-pointer group"
-                                    onClick={() => joinRoom(room.id)}
-                                >
-                                    <div className="flex justify-between items-start mb-3">
-                                        <h3 className="text-xl font-bold text-white group-hover:text-yellow-400 transition-colors">
-                                            {room.room_name}
-                                        </h3>
-                                        <span className={`px-3 py-1 rounded-full text-xs font-bold ${
-                                            room.status === 'waiting' 
-                                                ? 'bg-green-500/20 text-green-400' 
-                                                : 'bg-red-500/20 text-red-400'
-                                        }`}>
-                                            {room.status === 'waiting' ? 'MENUNGGU' : 'BERMAIN'}
-                                        </span>
-                                    </div>
-                                    <div className="space-y-2 text-sm">
-                                        <div className="flex justify-between">
-                                            <span className="text-slate-400">Players:</span>
-                                            <span className="text-white font-semibold">{room.players.length} orang</span>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                            {rooms.map(room => {
+                                const playerCount = Array.isArray(room.players) ? room.players.length : 0;
+                                const phase = room.current_phase || 'WAITING';
+                                const isPlaying = room.status === 'playing' || room.status === 'paused';
+                                return (
+                                    <div
+                                        key={room.id}
+                                        className="player-card"
+                                        style={{
+                                            padding: '16px 20px',
+                                            background: 'rgba(255,255,255,0.03)',
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            justifyContent: 'space-between',
+                                            gap: 12,
+                                            cursor: 'pointer',
+                                        }}
+                                        onClick={() => openJoinModal(room)}
+                                    >
+                                        <div style={{ flex: 1, minWidth: 0 }}>
+                                            <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 4, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                                {room.room_name}
+                                            </div>
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                                                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                                                    👥 {playerCount} pemain
+                                                </span>
+                                                {isPlaying && (
+                                                    <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                                                        · 💰 Pot: {formatRupiah(room.pot || 0)}
+                                                    </span>
+                                                )}
+                                            </div>
                                         </div>
-                                        <div className="flex justify-between">
-                                            <span className="text-slate-400">Pot:</span>
-                                            <span className="text-yellow-400 font-semibold">${room.pot}</span>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                                            <span className={`phase-badge phase-${phase.toLowerCase().replace('-','')}`}>
+                                                {phaseLabel(phase)}
+                                            </span>
+                                            <span style={{ fontSize: 13, color: 'var(--gold)', fontWeight: 700 }}>
+                                                Join →
+                                            </span>
                                         </div>
                                     </div>
-                                    <button className="w-full mt-4 py-2 bg-slate-600 hover:bg-yellow-500 hover:text-black rounded-lg font-semibold transition-all">
-                                        Join Room
-                                    </button>
-                                </div>
-                            ))}
+                                );
+                            })}
                         </div>
                     )}
                 </div>
             </div>
+
+            {/* ── Join Modal ── */}
+            {showJoinModal && (
+                <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) setShowJoinModal(null); }}>
+                    <div className="modal-box">
+                        <h2 style={{ fontSize: 20, fontWeight: 800, marginBottom: 4 }}>
+                            {showJoinModal.room_name}
+                        </h2>
+                        <p style={{ color: 'var(--text-muted)', fontSize: 13, marginBottom: 24 }}>
+                            Masukkan detail Anda untuk bergabung ke meja
+                        </p>
+
+                        {/* Role selection */}
+                        <label className="label">Masuk Sebagai</label>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 20 }}>
+                            {(['player', 'dealer'] as const).map(role => (
+                                <button
+                                    key={role}
+                                    onClick={() => setJoinRole(role)}
+                                    style={{
+                                        padding: '14px 12px',
+                                        borderRadius: 12,
+                                        border: joinRole === role ? '2px solid var(--gold)' : '1.5px solid var(--border-subtle)',
+                                        background: joinRole === role ? 'rgba(250,204,21,0.1)' : 'rgba(255,255,255,0.03)',
+                                        color: joinRole === role ? 'var(--gold)' : 'var(--text-secondary)',
+                                        fontWeight: 700,
+                                        fontSize: 14,
+                                        cursor: 'pointer',
+                                        textAlign: 'center',
+                                        transition: 'all 0.15s',
+                                    }}
+                                >
+                                    {role === 'player' ? '🃏 Pemain' : '🎰 Dealer'}
+                                    <div style={{ fontSize: 11, fontWeight: 400, marginTop: 4, opacity: 0.75 }}>
+                                        {role === 'player' ? 'Ikut bertaruh' : 'Pantau & kontrol'}
+                                    </div>
+                                </button>
+                            ))}
+                        </div>
+
+                        <label className="label">Nama Anda</label>
+                        <input
+                            className="input-field"
+                            placeholder={joinRole === 'dealer' ? 'Nama Dealer' : 'Nama Pemain'}
+                            value={joinName}
+                            onChange={e => setJoinName(e.target.value)}
+                            style={{ marginBottom: 16, fontFamily: 'Inter, sans-serif', fontWeight: 600 }}
+                            autoFocus
+                        />
+
+                        {joinRole === 'player' && (
+                            <>
+                                <label className="label">Saldo Awal (Rp)</label>
+                                <input
+                                    className="input-field"
+                                    type="number"
+                                    placeholder="500000"
+                                    value={joinBalance}
+                                    onChange={e => setJoinBalance(e.target.value)}
+                                    style={{ marginBottom: 16 }}
+                                />
+                                <div style={{ display: 'flex', gap: 8, marginBottom: 20, flexWrap: 'wrap' }}>
+                                    {[100000, 250000, 500000, 1000000].map(v => (
+                                        <button
+                                            key={v}
+                                            onClick={() => setJoinBalance(String(v))}
+                                            style={{
+                                                padding: '6px 12px',
+                                                borderRadius: 8,
+                                                background: joinBalance === String(v) ? 'rgba(250,204,21,0.2)' : 'rgba(255,255,255,0.05)',
+                                                border: joinBalance === String(v) ? '1px solid var(--gold)' : '1px solid var(--border-subtle)',
+                                                color: joinBalance === String(v) ? 'var(--gold)' : 'var(--text-muted)',
+                                                fontSize: 12,
+                                                fontWeight: 700,
+                                                cursor: 'pointer',
+                                                fontFamily: 'JetBrains Mono, monospace',
+                                            }}
+                                        >
+                                            {formatRupiah(v)}
+                                        </button>
+                                    ))}
+                                </div>
+                            </>
+                        )}
+
+                        <button
+                            className="btn-primary"
+                            onClick={handleJoinConfirm}
+                            disabled={!joinName.trim()}
+                            style={{ width: '100%', fontSize: 15 }}
+                        >
+                            Masuk ke Meja →
+                        </button>
+                        <button className="btn-ghost" onClick={() => setShowJoinModal(null)}
+                            style={{ width: '100%', marginTop: 10, fontSize: 13 }}>
+                            Batal
+                        </button>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
