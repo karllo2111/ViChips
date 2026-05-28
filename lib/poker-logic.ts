@@ -31,7 +31,6 @@ export type RoomData = {
   sb_index: number;
   bb_index: number;
   dealer_index: number;
-  dealer_id: string | null;        // name of dealer user
   players: Player[];
   winner: string | null;
   name: string | null;             // legacy field

@@ -184,7 +184,6 @@ export default function DealerPage({ params }: { params: Promise<{ id: string }>
         sb_index: sbIdx,
         bb_index: bbIdx,
         dealer_index: sbIdx, // Dealer chip sits on SB or custom
-        dealer_id: dealerName,
         players: updatedPlayers,
         winner: null,
       })
